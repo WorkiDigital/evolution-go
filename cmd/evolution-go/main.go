@@ -60,6 +60,7 @@ import (
 	server_handler "github.com/evolution-foundation/evolution-go/pkg/server/handler"
 	storage_interfaces "github.com/evolution-foundation/evolution-go/pkg/storage/interfaces"
 	minio_storage "github.com/evolution-foundation/evolution-go/pkg/storage/minio"
+	supabase_storage "github.com/evolution-foundation/evolution-go/pkg/storage/supabase"
 	user_handler "github.com/evolution-foundation/evolution-go/pkg/user/handler"
 	user_service "github.com/evolution-foundation/evolution-go/pkg/user/service"
 	whatsmeow_service "github.com/evolution-foundation/evolution-go/pkg/whatsmeow/service"
@@ -145,7 +146,15 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 
 	var mediaStorage storage_interfaces.MediaStorage
 	var err error
-	if config.MinioEnabled {
+	if os.Getenv("SUPABASE_URL") != "" {
+		if config.MinioEnabled { log.Fatal("enable either Supabase Storage or MinIO, not both") }
+		mediaStorage, err = supabase_storage.New(
+			os.Getenv("SUPABASE_URL"),
+			os.Getenv("SUPABASE_SERVICE_ROLE_KEY"),
+			os.Getenv("SUPABASE_STORAGE_BUCKET"),
+		)
+		if err != nil { log.Fatal(err) }
+	} else if config.MinioEnabled {
 		mediaStorage, err = minio_storage.NewMinioMediaStorage(
 			config.MinioEndpoint,
 			config.MinioAccessKey,
@@ -202,6 +211,14 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	pollHandler := poll_handler.NewPollHandler(whatsmeowService.GetPollService(), loggerWrapper)
 
 	r := gin.Default()
+	// WorkiDigital: daemon-only loopback liveness endpoint for Vercel.
+	// It is registered before the original license gate and protected by
+	// a 127.0.0.1-only listener when EVO_VERCEL_DAEMON is set.
+	if os.Getenv("EVO_VERCEL_DAEMON") == "1" {
+		r.GET("/_bridge/health", func(ctx *gin.Context) {
+			ctx.JSON(http.StatusOK, gin.H{"status": "ok"})
+		})
+	}
 
 	// CORS middleware — must be before everything else
 	r.Use(func(c *gin.Context) {
@@ -355,6 +372,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if daemonMode {
+		if err := vercelbridge.ValidateTokenKey(os.Getenv("BRIDGE_TOKEN_KEY")); err != nil { log.Fatal(err) }
 		// Session-level lock: protects against overlapping Daemon deployments.
 		sqlDB, err := db.DB()
 		if err != nil { log.Fatal(err) }
@@ -438,7 +456,7 @@ func main() {
 		// Worker dispatches queued requests through the authenticated Gin router.
 		sqlDB, err := db.DB()
 		if err != nil { log.Fatal(err) }
-		go vercelbridge.RunWorker(heartbeatCtx, sqlDB, r, cfg.GlobalApiKey)
+		go vercelbridge.RunWorker(heartbeatCtx, sqlDB, r, os.Getenv("BRIDGE_TOKEN_KEY"))
 	}
 
 	listenAddr := ":" + os.Getenv("SERVER_PORT")
